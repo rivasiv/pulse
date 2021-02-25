@@ -6,11 +6,11 @@
 #include <stdbool.h>
 #include <pthread.h>
 
-#include "../lib/bdev/nvme/bdev_nvme.h"
+#include "/root/pktCaptSol/spdk/module/bdev/nvme/bdev_nvme.h" 
 
 #include "spdk/stdinc.h"
 #include "spdk/bdev.h"
-#include "spdk/copy_engine.h"
+#include "spdk/accel_engine.h"
 #include "spdk/conf.h"
 #include "spdk/env.h"
 #include "spdk/io_channel.h"
@@ -21,12 +21,12 @@
 #define MB 1048576
 #define K4 4096
 #define NVME_MAX_BDEVS_PER_RPC 32
-#define DEVICE_NAME "s4msung"
+#define DEVICE_NAME "PBlaze5"
 #define NUM_THREADS 4
 
 /* Used to pass messages between fio threads */
 struct pls_msg {
-	spdk_thread_fn	cb_fn;
+	spdk_msg_fn	cb_fn;
 	void		*cb_arg;
 };
 
@@ -59,7 +59,7 @@ struct pls_poller
 	TAILQ_ENTRY(pls_poller)	link;
 };
 
-char *pci_nvme_addr = "0000:02:00.0";
+char *pci_nvme_addr = "0001:01:00.0";
 const char *names[NVME_MAX_BDEVS_PER_RPC];
 pls_thread_t pls_ctrl_thread;
 pls_thread_t pls_thread[NUM_THREADS];
@@ -123,8 +123,8 @@ static size_t pls_poll_thread(pls_thread_t *thread)
 }
 
 //This is pass message function for spdk_allocate_thread
-//typedef void (*spdk_thread_fn)(void *ctx);
-static void pls_send_msg(spdk_thread_fn fn, void *ctx, void *thread_ctx)
+//typedef void (*spdk_msg_fn)(void *ctx);
+static void pls_send_msg(spdk_msg_fn fn, void *ctx, void *thread_ctx)
 {
         pls_thread_t *thread = thread_ctx;
         struct pls_msg *msg;
@@ -138,7 +138,7 @@ static void pls_send_msg(spdk_thread_fn fn, void *ctx, void *thread_ctx)
         msg->cb_fn = fn;
         msg->cb_arg = ctx;
 
-        count = spdk_ring_enqueue(thread->ring, (void **)&msg, 1);
+        count = spdk_ring_enqueue(thread->ring, (void **)&msg, 1, NULL);
         if (count != 1) {
                 SPDK_ERRLOG("Unable to send message to thread %p. rc: %lu\n", thread, count);
         }
@@ -181,6 +181,80 @@ pls_stop_poller(struct spdk_poller *poller, void *thread_ctx)
 	TAILQ_REMOVE(&thread->pollers, lpoller, link);
 
 	free(lpoller);
+}
+
+/* Reports status of created bde over NVME device. 
+ *
+ *  @{Params} :
+ *     @{in} void *cb_ctx      : Context structure with info we wand passthru the creation process
+ *     @{in} size_t bdev_count : Count of bdev devices
+ *     @{in} int rc            : Return code propagated. Errno codes with '-' used.
+ * 
+ *   @{Return} : None
+ * 
+ * */
+
+static void
+tracepulspdk_bdev_nvme_attach_controller_done (void *cb_ctx, size_t bdev_count, int rc)
+{
+	size_t i;
+
+	if (cb_ctx != NULL) {
+		printf("Error! %s: SPDK bdev wrong context.", __FUNCTION__);
+		return;
+	}
+
+	if (rc < 0) {
+		printf("Error! %s: SPDK bdev returns error %d(%s).", __FUNCTION__, -errno, strerror(-errno));
+		return;
+	}
+
+	for (i = 0; i < bdev_count; i++) {
+		printf("Error! %s: SPDK bdev %s added!", __FUNCTION__, names[i]);
+	}
+
+    return;
+}
+
+/*
+ *  SPDK thread functions 
+ */
+static int
+pls_reactor_thread_op(struct spdk_thread *thread, enum spdk_thread_op op)
+{
+
+    debug("Debug! Entered %s.", __FUNCTION__ );
+
+	switch (op) {
+		case SPDK_THREAD_OP_NEW:
+			//pls_send_msg(thread);
+			printf("\nReachecd scheduler");
+			return 0; 
+		case SPDK_THREAD_OP_RESCHED:
+			printf("\nShouldn't be here");
+			return -1;
+		default:
+			return -ENOTSUP;
+	}
+
+	return 0;
+}
+
+static bool
+pls_reactor_thread_op_supported(enum spdk_thread_op op)
+{
+    debug("Debug! Entered %s.", __FUNCTION__ );
+
+	switch (op) {
+		case SPDK_THREAD_OP_NEW:
+			return true;
+		case SPDK_THREAD_OP_RESCHED:
+			return false;
+		default:
+			return false;
+	}
+
+	return false;
 }
 
 int init(void)
@@ -244,7 +318,7 @@ int init(void)
 	}
 
 	// Initializes the calling(current) thread for I/O channel allocation
-	/* typedef void (*spdk_thread_pass_msg)(spdk_thread_fn fn, void *ctx,
+	/* typedef void (*spdk_thread_pass_msg)(spdk_msg_fn fn, void *ctx,
 				     void *thread_ctx); */
 	
 	pls_ctrl_thread.thread = spdk_allocate_thread(pls_send_msg, pls_start_poller,
@@ -259,8 +333,8 @@ int init(void)
 
 	TAILQ_INIT(&pls_ctrl_thread.pollers);
 
-	/* Initialize the copy engine */
-	spdk_copy_engine_initialize();
+	/* Initialize the acceleration engine. */
+	spdk_accel_engine_initialize();
 
 	/* Initialize the bdev layer */
 	spdk_bdev_initialize(pls_bdev_init_done, &done);
@@ -327,7 +401,7 @@ void* init_thread(void *arg)
 	}
 
 	// Initializes the calling(current) thread for I/O channel allocation
-	/* typedef void (*spdk_thread_pass_msg)(spdk_thread_fn fn, void *ctx,
+	/* typedef void (*spdk_thread_pass_msg)(spdk_msg_fn fn, void *ctx,
 				     void *thread_ctx); */
 	
 	t->thread = spdk_allocate_thread(pls_send_msg, pls_start_poller,

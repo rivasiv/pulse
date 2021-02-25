@@ -30,9 +30,19 @@ sysctl -w kernel.core_pattern=core_%p_%t
 setup spdk
 -----
 [root@paul spdkp]# sudo ./scripts/setup.sh
+[root@paul spdkp]# sudo ./scripts/setup.sh --reset | to get nvme back to the system
+ #setup.sh --help
+ #setup.sh --reset
+
+setup hw
+-----
+#x64 - old setup 
 0000:04:00.0 (144d a804): nvme -> uio_pci_generic
 0000:05:00.0 (144d a804): nvme -> uio_pci_generic
 Active mountpoints on /dev/nvme2n1, so not binding PCI dev 0000:06:00.0
+
+#nxp aarm64 
+0001:01:00.0 PBlaze5
 
 
 sequence to run raid app:

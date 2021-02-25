@@ -8,7 +8,9 @@
 
 #include <odp_api.h>
 
-#include "/root/pktCaptSol/spdk/module/bdev/nvme/bdev_nvme.h" 
+#include <rte_errno.h>
+
+#include "../../module/bdev/nvme/bdev_nvme.h" 
 
 #include "spdk/stdinc.h"
 #include "spdk/bdev.h"
@@ -19,8 +21,9 @@
 #include "spdk/log.h"
 #include "spdk/string.h"
 #include "spdk/queue.h"
+#include "spdk/env_dpdk.h"
 
-#define VERSION "0.98"
+#define VERSION "0.971"
 #define MB 1048576
 #define K4 4096
 #define SHM_PKT_POOL_BUF_SIZE  1856
@@ -28,7 +31,6 @@
 #define NVME_MAX_BDEVS_PER_RPC 32
 #define MAX_PACKET_SIZE 1600
 #define DEVICE_NAME "PBlaze5"
-#define DEVICE_NAME_NQN "PBlaze5nqn"
 #define NUM_THREADS 4
 #define NUM_INPUT_Q 4
 
@@ -36,6 +38,9 @@
 #define FILE_NAME "dump.pcap"
 #define BUFFER_SIZE 1048576
 //#define BUFFER_SIZE 1024
+#define THREAD_OFFSET 0x100000000	//4Gb of offset for every thread 
+#define THREAD_LIMIT 0x100000000	//space for every thread to write
+//#define THREAD_LIMIT 0x900		//space for every thread to write
 #define READ_LIMIT 0x100000000		//space for every thread to read
 
 //OPTIONS
@@ -55,24 +60,12 @@ typedef struct global_s
 {
 	mode_e mode;
 	char *pci_nvme_addr;
-	uint32_t block_size;
-	uint64_t num_blocks;
-	uint64_t max_offset; 
-	atomic_ulong overwrap_cnt;
-	atomic_ulong offset;		//global atomic offset for whole device
-	atomic_ulong wrote_offset;	//global atomic offset already guaranteed wrote
 } global_t;
 
 static global_t global = 
 {
 	.mode = MODE_WRITE,
-	.pci_nvme_addr = "0001:01:00.0"
-	.block_size = 0,
-	.num_blocks = 0,
-	.max_offset = 0,
-	.overwrap_cnt = 0,
-	.offset = 0,
-	.wrote_offset = 0,
+	.pci_nvme_addr = "0001:01:00.0",
 };
 
 /* Used to pass messages between fio threads */
@@ -92,11 +85,14 @@ typedef struct pls_target_s
 
 typedef struct pls_thread_s
 {
+	uint32_t core;  //CPU core thread is assigned to
+
 	bool finished;
 	int idx;
 	bool read_complete;		//flag, false when read callback not finished, else - tru
         unsigned char *buf;
 	uint64_t offset;		//just for stats
+	atomic_ulong a_offset;		//atomic offset for id 0 thread
 	pthread_t pthread_desc;
         struct spdk_thread *thread; /* spdk thread context */
         struct spdk_ring *ring; /* ring for passing messages to this thread */
@@ -140,6 +136,8 @@ void* init_read_thread(void *arg);
 int init_spdk(void);
 int init_odp(void);
 
+int deinit_spdk(void);
+
 void hexdump(void *addr, unsigned int size)
 {
         unsigned int i;
@@ -170,7 +168,7 @@ void hexdump(void *addr, unsigned int size)
 
 static void pls_bdev_init_done(void *cb_arg, int rc)
 {
-	printf("bdev init is done\n");
+	printf("\nNotice! bdev init is done.\n");
 	*(bool *)cb_arg = true;
 }
 
@@ -359,8 +357,17 @@ static void pls_bdev_write_done_cb(struct spdk_bdev_io *bdev_io, bool success, v
 		debug("write completed successfully\n");
 		//cnt++;
 		__atomic_fetch_add(&cnt, 1, __ATOMIC_SEQ_CST);
-		if (global.wrote_offset < t->offset)
-			global.wrote_offset = t->offset;
+
+#if 0
+		bytes_wrote += BUFFER_SIZE;
+		now = time(0);
+	        if (now > old)
+                {
+
+
+		}
+#endif
+
 	}
 	else
 		printf("write failed\n");
@@ -436,7 +443,7 @@ static void pls_send_msg(spdk_msg_fn fn, void *ctx, void *thread_ctx)
         struct pls_msg *msg;
         size_t count;
 
-	printf("%s() called \n", __func__);
+		printf("%s() called \n", __func__);
 
         msg = calloc(1, sizeof(*msg));
         assert(msg != NULL);
@@ -488,6 +495,40 @@ static void pls_stop_poller(struct spdk_poller *poller, void *thread_ctx)
 	free(lpoller);
 }
 
+/* Reports status of created bde over NVME device. 
+ *
+ *  @{Params} :
+ *     @{in} void *cb_ctx      : Context structure with info we wand passthru the creation process
+ *     @{in} size_t bdev_count : Count of bdev devices
+ *     @{in} int rc            : Return code propagated. Errno codes with '-' used.
+ * 
+ *   @{Return} : None
+ * 
+ * */
+
+static void
+tracepulspdk_bdev_nvme_attach_controller_done (void *cb_ctx, size_t bdev_count, int rc)
+{
+	size_t i;
+
+    printf("\n\ntracepulspdk_bdev_nvme_attach_controller_done %d\n\n", bdev_count);
+
+	if (cb_ctx != NULL) {
+		printf("Error! %s: SPDK bdev wrong context.", __FUNCTION__);
+		return;
+	}
+
+	if (rc < 0) {
+		printf("Error! %s: SPDK bdev returns error %d(%s).", __FUNCTION__, -errno, strerror(-errno));
+		return;
+	}
+
+	for (i = 0; i < bdev_count; i++) {
+		printf("Notice! %s: SPDK bdev %s added!", __FUNCTION__, names[i]);
+	}
+
+    return;
+}
 
 /*
  *  SPDK thread functions 
@@ -541,14 +582,13 @@ int init_spdk(void)
 	//this identifies an unique endpoint on an NVMe fabric
 	struct spdk_nvme_transport_id trid = {};
 	size_t count = NVME_MAX_BDEVS_PER_RPC;
+	struct spdk_nvme_host_id hostid = {};
+	uint32_t prchk_flags = 0;	
 	int i;
 
 	printf("%s() called \n", __func__);
 
-	/* Parse the SPDK configuration file */
-
 	//just allocate mem via calloc
-	//
 #if 0
 	config = spdk_conf_allocate();
 	if (!config) {
@@ -575,29 +615,85 @@ int init_spdk(void)
 	spdk_env_opts_init(&opts);
 	opts.name = "bdev_pls";
 
-	if (spdk_env_init(&opts) < 0) {
-		SPDK_ERRLOG("Unable to initialize SPDK env\n");
-		//spdk_conf_free(config);
-		return -1;
+    /* Init SPDK */  
+    if (spdk_env_dpdk_external_init()) {
+        printf("SPDK initialization started");
+		if (spdk_env_dpdk_post_init(false) < 0) {
+			SPDK_ERRLOG("Failed to initialize SPDK\n");
+			return -1;
+		}
 	}
-	spdk_unaffinitize_thread();
+	else {
+		/*Not sure this have sence, since utility shouldn't be used without inited ODP*/
+		if (spdk_env_init(&opts) < 0) {
+			SPDK_ERRLOG("Unable to initialize SPDK env\n");
+			//spdk_conf_free(config);
+			return -1;
+		}
+	}
+
+#if 1 // to check the dpdk 
+{
+/*        unsigned lcore_id;
+        lcore_id = rte_lcore_id();
+        printf("lcore %u\n", lcore_id);
+*/
+
+        printf("\n\n create mempool \n");
+        struct rte_mempool *mp;
+        mp = rte_mempool_create("MP", 1024,
+                                32, 32, 0,
+                                NULL, NULL, NULL, NULL,
+                                0, 0);
+        if (NULL == mp) {
+                printf("mempool init fail\n");
+				printf(" failed to create mempool, ret (%s) ~~\n", rte_strerror(rte_errno));
+                return -1;
+        }
+        printf("mempool init pass\n");
+
+        rte_mempool_free(mp);
+} 
+getchar();
+#endif /*1*/
+
+	//Removes CPU assignment.
+	//spdk_unaffinitize_thread();
+
+    // TBD check if we need to use spdk_env_get_current_core and control spdk thread creation per core or it's done in libtrace callbacks
+	// Should num of cores used be correcponded with number of threads? 
+	rv = spdk_thread_lib_init_ext(pls_reactor_thread_op, pls_reactor_thread_op_supported, 0 /*sizeof(struct pls_thread_ctrl_t*/);
+	if (0 != rv)
+	{
+		printf("Error! Thread module init failed.");
+		return rv;
+	}
 
 	//ring init (calls rte_ring_create() from DPDK inside)
-	pls_ctrl_thread.ring = spdk_ring_create(SPDK_RING_TYPE_MP_SC, 4096, SPDK_ENV_SOCKET_ID_ANY);
+	pls_ctrl_thread.ring = spdk_ring_create(SPDK_RING_TYPE_MP_SC, 1024, SPDK_ENV_SOCKET_ID_ANY); //4096
 	if (!pls_ctrl_thread.ring) 
 	{
 		SPDK_ERRLOG("failed to allocate ring\n");
 		return -1;
 	}
 
+//	rc = spdk_env_thread_launch_pinned(i,  nvmf_reactor_run, nvmf_reactor);
+
+#if 1
+	struct spdk_cpuset cpumask;
+	spdk_cpuset_zero(&cpumask);
+	spdk_cpuset_set_cpu(&cpumask, spdk_env_get_current_core(), true);  //Assigns control threas to the base core.
+	pls_ctrl_thread.thread = spdk_thread_create("pls_ctrl_thread", &cpumask);	
+	spdk_set_thread(pls_ctrl_thread.thread); //fini procedure to be done
+#else
 	// Initializes the calling(current) thread for I/O channel allocation
-	/* typedef void (*spdk_thread_pass_msg)(spdk_msg_fn fn, void *ctx,
+	/* typedef void (*spdk_thread_pass_msg)(spdk_thread_fn fn, void *ctx,
 				     void *thread_ctx); */
 	
 	pls_ctrl_thread.thread = spdk_allocate_thread(pls_send_msg, pls_start_poller,
                                  pls_stop_poller, &pls_ctrl_thread, "pls_ctrl_thread");
-
-        if (!pls_ctrl_thread.thread) 
+#endif 
+    if (!pls_ctrl_thread.thread) 
 	{
                 spdk_ring_free(pls_ctrl_thread.ring);
                 SPDK_ERRLOG("failed to allocate thread\n");
@@ -607,7 +703,8 @@ int init_spdk(void)
 	TAILQ_INIT(&pls_ctrl_thread.pollers);
 
 	/* Initialize the acceleration engine. */
-	spdk_accel_engine_initialize();
+	// This may be called from pollers only? 	
+	//spdk_accel_engine_initialize();
 
 	/* Initialize the bdev layer */
 	spdk_bdev_initialize(pls_bdev_init_done, &done);
@@ -628,20 +725,32 @@ int init_spdk(void)
 
 	//create device
 	/*
-	spdk_bdev_nvme_create(struct spdk_nvme_transport_id *trid,
-		      const char *base_name,
-		      const char **names, size_t *count)
-	*/
+	int spdk_bdev_nvme_create(struct spdk_nvme_transport_id *trid,       # Transport structure
+				struct spdk_nvme_host_id *hostid,                        # NVME over Fabric 
+				const char *base_name,                                   # Device name - predefined
+				const char **names,                                      # Names of bde returned. Out value 
+				uint32_t count,                                          # bde devices count
+				const char *hostnqn,                                     # 
+				uint32_t prchk_flags,                                    # Optimization flags, looks like default are fine for now. TBD
+				spdk_bdev_create_nvme_fn cb_fn,                          # Creation report callback
+				void *cb_ctx,                                            # Used mostly as rpc context transfer, since we do not use it == NULL
+				struct spdk_nvme_ctrlr_opts *opts);                      # probe() options
+		*/
 	//fill up trid.
 	trid.trtype = SPDK_NVME_TRANSPORT_PCIE;
 	trid.adrfam = 0;
 	memcpy(trid.traddr, global.pci_nvme_addr, strlen(global.pci_nvme_addr));
-	
+	snprintf(&trid.trstring[0], SPDK_NVMF_TRSTRING_MAX_LEN, "%s", SPDK_NVME_TRANSPORT_NAME_PCIE);
+	struct spdk_nvme_ctrlr_opts bdev_opts;
+
+    //int ctx1 =1;
+    // prchk_flags = SPDK_NVME_IO_FLAGS* -- TBD: Do additional checks on flags. Do not found any default one.
+
 	printf("creating bdev device...\n");
 	//in names returns names of created devices, in count returns number of devices
-	//5th param hostnqn - host NVMe Qualified Name. used only for nvmeof.
-	//unused for local pcie connected devices
-	rv = spdk_bdev_nvme_create(&trid, DEVICE_NAME, names, &count, DEVICE_NAME_NQN);
+	//TBD : shouldn't use spdk_nvme_probe, spdk_nvme_connect, etc instead of create?
+	rv = bdev_nvme_create(&trid, &hostid, DEVICE_NAME, names, count, NULL,
+				   prchk_flags, tracepulspdk_bdev_nvme_attach_controller_done, NULL, &bdev_opts);
 	if (rv)
 	{
 		printf("error: can't create bdev device!\n");
@@ -652,6 +761,32 @@ int init_spdk(void)
 		printf("#%d: device %s created \n", i, names[i]);
 	}
 
+	return rv;
+}
+
+/* @{Function} deinit_spdk
+ * 
+ *   @{Purpose} Handles SPDK deinit logic
+ *      @{in} void
+ *      @{out} int rv : 0 in success cases, negative ERRNO in failed cases 
+ * 
+ *   @{note} 
+ */
+int deinit_spdk(void)
+{
+	int rv = 0;
+
+	/*TBD*/
+    /* rpc_bdev_nvme_detach_controller */   // TBD Is it more resonable to use nvme connect/detouch?
+	/*Ctrl-c handler if not to add it SPDK may stuck on hugepage allocation.*/
+
+	// De-init SPDK thread module
+    spdk_thread_lib_fini();
+ 	spdk_env_dpdk_post_fini();
+/*    if (libtrace_thread_alloc_num != 0) {
+		printf("\nNot all threads were freed.");
+	}
+*/
 	return rv;
 }
 
@@ -696,11 +831,15 @@ void* init_read_thread(void *arg)
 	int rv = 0;
 	uint64_t nbytes = BUFFER_SIZE;
 	pls_thread_t *t = &pls_read_thread;
+	pls_thread_t *t0 = &pls_thread[0];	//ptr to writer0 thread
 	uint64_t offset;
+	uint64_t thread_limit;
 	static uint64_t readbytes = 0;
 	void *bf;
 
+	//init offset
 	offset = 0;
+	thread_limit = offset + READ_LIMIT;
 
 	t->ring = spdk_ring_create(SPDK_RING_TYPE_MP_SC, 4096, SPDK_ENV_SOCKET_ID_ANY);
 	if (!t->ring) 
@@ -710,18 +849,21 @@ void* init_read_thread(void *arg)
 	}
 
 	// Initializes the calling(current) thread for I/O channel allocation
-	/* typedef void (*spdk_thread_pass_msg)(spdk_msg_fn fn, void *ctx,
+	/* typedef void (*spdk_thread_pass_msg)(spdk_thread_fn fn, void *ctx,
 				     void *thread_ctx); */
-	
+#if 1
+    // As per my understanding previously this was assigned to some core only. But now it looks it's still possible to use it withoud assigned core 
+	t->thread = spdk_thread_create("pls_reader_thread", 0);	
+#else	
 	t->thread = spdk_allocate_thread(pls_send_msg, pls_start_poller,
                                  pls_stop_poller, (void*)t, "pls_reader_thread");
-
-        if (!t->thread) 
+#endif
+    if (!t->thread) 
 	{
-                spdk_ring_free(t->ring);
-                SPDK_ERRLOG("failed to allocate thread\n");
-                return NULL;
-        }
+        spdk_ring_free(t->ring);
+        SPDK_ERRLOG("failed to allocate thread\n");
+        return NULL;
+    }
 
 	TAILQ_INIT(&t->pollers);
 
@@ -751,7 +893,6 @@ void* init_read_thread(void *arg)
 		rv = -1; return NULL;
 	}
 
-	sleep(3);	//need to wait till we write some data
 	printf("read thread started\n");
 
 	while(1)
@@ -764,21 +905,18 @@ void* init_read_thread(void *arg)
 		}
 		t->read_complete = false;
 
-		//wait here till threads do some writing
+		//wait here till write thread with id 0 do some writing
 		if (global.mode == MODE_RW)
 		{
-			if (global.overwrap_cnt == 0)
+			while (offset + BUFFER_SIZE > t0->a_offset)
 			{
-				while (offset + BUFFER_SIZE >= global.wrote_offset)
-				{
-					printf("read wait. read_offset: 0x%lx , wr0te_offset: 0x%lx \n",
-						offset, global.wrote_offset);
-					usleep(100000);		
-				}
+				printf("read wait. read_offset: 0x%lx , write_offset: 0x%lx \n",
+					offset, t0->a_offset);
+				usleep(100000);		
 			}
 
-			printf("read now. read_offset: 0x%lx , wr0te_offset: 0x%lx \n",
-				offset, global.wrote_offset);
+			printf("read now. read_offset: 0x%lx , write_offset: 0x%lx \n",
+				offset, t0->a_offset);
 		}
 
 		rv = spdk_bdev_read(t->pls_target.desc, t->pls_target.ch,
@@ -811,6 +949,13 @@ void* init_read_thread(void *arg)
 		//hexdump(bf, 2048);
 
 		spdk_dma_free(bf);
+
+		//exit in case we read enough
+		if (readbytes >= thread_limit)
+		{
+			printf("read is over\n");
+			break;
+		}
 	}
 
 	return NULL;
@@ -822,7 +967,9 @@ void* init_thread(void *arg)
 	uint64_t nbytes = BUFFER_SIZE;
 	pls_thread_t *t = (pls_thread_t*)arg;
 	uint64_t offset;
+	uint64_t thread_limit;
 	uint64_t position = 0;
+	//static uint64_t readbytes = 0;
 	int pkt_len;
 	unsigned short len;
 	//void *bf;
@@ -831,7 +978,11 @@ void* init_thread(void *arg)
 	odp_packet_t pkt;
 	odp_time_t time;
 
-	//printf("%s() called from thread #%d. offset: 0x%lx\n", __func__, t->idx, offset);
+	//init offset
+	offset = t->idx * THREAD_OFFSET; //each thread has a 4 Gb of space
+	t->a_offset = offset;
+	thread_limit = offset + THREAD_LIMIT;
+	printf("%s() called from thread #%d. offset: 0x%lx\n", __func__, t->idx, offset);
 
 	t->ring = spdk_ring_create(SPDK_RING_TYPE_MP_SC, 4096, SPDK_ENV_SOCKET_ID_ANY);
 	if (!t->ring) 
@@ -839,20 +990,23 @@ void* init_thread(void *arg)
 		printf("failed to allocate ring\n");
 		rv = -1; return NULL;
 	}
-
+#if 1
+    // As per my understanding previously this was assigned to some core only. But now it looks it's still possible to use it withoud assigned core 
+	t->thread = spdk_thread_create("pls_writer_thread", 0);	
+#else
 	// Initializes the calling(current) thread for I/O channel allocation
-	/* typedef void (*spdk_thread_pass_msg)(spdk_msg_fn fn, void *ctx,
+	/* typedef void (*spdk_thread_pass_msg)(spdk_thread_fn fn, void *ctx,
 				     void *thread_ctx); */
 	
 	t->thread = spdk_allocate_thread(pls_send_msg, pls_start_poller,
                                  pls_stop_poller, (void*)t, "pls_writer_thread");
-
-        if (!t->thread) 
+#endif
+    if (!t->thread) 
 	{
-                spdk_ring_free(t->ring);
-                SPDK_ERRLOG("failed to allocate thread\n");
-                return NULL;
-        }
+        spdk_ring_free(t->ring);
+        SPDK_ERRLOG("failed to allocate thread\n");
+        return NULL;
+    }
 
 	TAILQ_INIT(&t->pollers);
 
@@ -871,17 +1025,6 @@ void* init_thread(void *arg)
 	{
 		printf("failed to open device\n");
 		return NULL;
-	}
-
-	//get device size
-	if (t->idx == 0)
-	{
-		global.block_size = spdk_bdev_get_block_size(t->pls_target.bd);
-		global.num_blocks = spdk_bdev_get_num_blocks(t->pls_target.bd);
-		printf("device block size is: %u bytes, num blocks: %lu\n", 
-			global.block_size, global.num_blocks);
-		global.max_offset = global.block_size * global.num_blocks - 1;
-		printf("max offset(bytes): 0x%lx\n", global.max_offset);
 	}
 
 	printf("open io channel\n");
@@ -990,31 +1133,38 @@ void* init_thread(void *arg)
 			}
 			else
 			{
-				//get global atomic offset value, increase it before writing.
-				//t->offset used  in read/write callbacks
-				t->offset = offset = global.offset;
-				global.offset += nbytes;
-
-				//overwrap
-				if (global.offset > global.max_offset)
+				//quit if we reached thread_limit
+				if (offset + nbytes >= thread_limit)
 				{
-					global.offset = 0;
-					t->offset = offset = global.offset;
-					global.offset += nbytes;
-					global.overwrap_cnt++;
-					printf("overwrap is done. now overwraps: %lu \n", global.overwrap_cnt);
+					printf("#%d. thread limit reached: 0x%lx\n", t->idx, thread_limit);
+					odp_packet_free(pkt);
+					if (t->buf)
+					{
+						spdk_dma_free(t->buf);
+						t->buf = NULL;
+					}
+#if 0
+					//in case of thread id 0 we do reading, other threads just quit
+					if (global.mode == MODE_READ /*|| global.mode == MODE_RW*/)
+						if (t->idx == 0)
+							goto read;
+#endif
+					return NULL;
 				}
-
+#ifdef HL_DEBUGS
+				printf("writing %lu bytes from thread# #%d, offset: 0x%lx\n",
+					nbytes, t->idx, offset);
+#endif
+				t->offset = offset;
+				t->a_offset = offset;
 				rv = spdk_bdev_write(t->pls_target.desc, t->pls_target.ch, 
-					t->buf, offset, nbytes, pls_bdev_write_done_cb, t);
+					t->buf, offset, /*position*/ nbytes, pls_bdev_write_done_cb, t);
 				if (rv)
 					printf("#%d spdk_bdev_write failed, offset: 0x%lx, size: %lu\n",
 						t->idx, offset, nbytes);
-#ifdef HL_DEBUGS
-				else
-					printf("writing %lu bytes from thread# #%d, offset: 0x%lx\n",
-						nbytes, t->idx, offset);
-#endif
+
+				offset += nbytes;
+				//offset += position;
 
 				//need to wait for bdev write completion first
 				while(t->buf)
@@ -1039,6 +1189,64 @@ void* init_thread(void *arg)
 		}
 		odp_packet_free(pkt);
 	}
+
+#if 0
+read:
+	//wait before reading data back
+	sleep(1);
+
+	//reading data back to check is it correctly wrote
+	printf("now trying to read data back\n");
+	offset = t->idx * 0x10000000;
+
+	while(1)
+	{
+		bf = spdk_dma_zmalloc(nbytes, 0, NULL);
+		if (!bf)
+		{
+			printf("failed to allocate RAM for reading\n");
+			return NULL;
+		}
+		t->read_complete = false;
+		rv = spdk_bdev_read(t->pls_target.desc, t->pls_target.ch,
+			bf, offset, nbytes, pls_bdev_read_done_cb, t);
+		//printf("after spdk read\n");
+		if (rv)
+			printf("spdk_bdev_read failed\n");
+		else
+		{
+			offset += nbytes;
+			readbytes += nbytes;
+			//printf("spdk_bdev_read NO errors\n");
+		}
+		//need to wait for bdev read completion first
+		while(t->read_complete == false)
+		{
+			usleep(10);
+		}
+
+		//parsing packets here and creating pcap
+		//in bf pointer we have buf with data read
+		//writing to .pcap file is also here
+		int r = pls_pcap_create(bf);
+		if (r)
+		{
+			printf("error creating pcap\n");
+		}
+
+		//print dump
+		//hexdump(bf, 2048);
+
+		spdk_dma_free(bf);
+
+		//exit in case we read enough
+		if (readbytes >= READ_LIMIT)
+		{
+			printf("read is over\n");
+			break;
+		}
+	}
+#endif
 
 	return NULL;
 }
@@ -1080,22 +1288,24 @@ int main(int argc, char *argv[])
 	//enable logging
 	spdk_log_set_print_level(SPDK_LOG_DEBUG);
 	spdk_log_set_level(SPDK_LOG_DEBUG);
-	spdk_log_open();
+	spdk_log_open(NULL);
 
-	rv = init_odp();
-	if (rv)
-	{
-		printf("odp init failed. exiting\n");
-		exit(1);
+    //init DPDK 
+	rv = rte_eal_init(argc, argv);
+	if (rv < 0) {
+    	rte_exit(EXIT_FAILURE, "Error with EAL initialization\n");
 	}
 
 	rv = init_spdk();
 	if (rv)
 	{
-		printf("init failed. exiting\n");
+		printf("SPDK init failed. exiting\n");
+		deinit_spdk();
 		exit(1);
 	}
+    getchar();
 
+#if 0
 	// do odp init and create write threads only in these modes
 	if (global.mode == MODE_RW || global.mode == MODE_WRITE)
 	{
@@ -1117,6 +1327,7 @@ int main(int argc, char *argv[])
 		}
 		sleep(1);
 	}
+
 
 	//creating read thread for RW or READ mode, to read in parallel
 	if (global.mode == MODE_RW || global.mode == MODE_READ)
@@ -1190,6 +1401,8 @@ int main(int argc, char *argv[])
 		}
 		usleep(10);
 	}
+#endif
+
 #if 0
 	if (global.mode == MODE_WRITE)
 	{
@@ -1208,4 +1421,6 @@ int main(int argc, char *argv[])
 	}
 
 	return rv;
+
+  return 0;
 }

@@ -1,0 +1,26 @@
+SPDK_ROOT_DIR := /root/pktCaptSol2/spdk
+#SPDK_ROOT_DIR := $(abspath $(CURDIR)/../..)
+include $(SPDK_ROOT_DIR)/mk/spdk.common.mk
+include $(SPDK_ROOT_DIR)/mk/spdk.modules.mk
+
+
+#DPDK_LIB = -lspdk_env_dpdk -lrte_eal -lrte_mempool -lrte_ring -lrte_mbuf -lrte_mempool_ring -lrte_pci
+#DPDK_LIB += -lrte_bus_pci -lrte_kvargs -lrte_vhost -lrte_net -lrte_hash -lrte_telemetry
+#DPDK_LIB += -lrte_cryptodev -lrte_power -lrte_rcu
+
+PULSEDEBUG = -g -DDEBUG=1 
+
+CFLAGS += $(PULSEDEBUG) -Wl,--no-as-needed  
+
+APP = bdev_odp
+
+C_SRCS := bdev_odp.c
+
+SPDK_LIB_LIST = $(ALL_MODULES_LIST) bdev_nvme 
+
+#SYS_LIBS += -lspdk_event_bdev -lspdk_event_accel -lspdk_event_vmd -lspdk_bdev -lspdk_bdev_malloc -lspdk_log -lspdk_thread -lspdk_util -lspdk_event \
+#	$(DPDK_LIB) -Wl,--no-whole-archive -lnuma -lodp-dpdk
+
+SYS_LIBS += -lodp-dpdk   
+
+include $(SPDK_ROOT_DIR)/mk/spdk.app.mk
