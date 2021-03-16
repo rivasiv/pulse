@@ -781,6 +781,15 @@ int init_spdk(void)
 		// prchk_flags = SPDK_NVME_IO_FLAGS* -- TBD: Do additional checks on flags. Do not found any default one.
 
 		printf("creating bdev device...\n");
+
+		ctx->count = NVME_MAX_BDEVS_PER_RPC;
+		rv = bdev_nvme_create(&trid, &hostid, ctx->req.name /* DEVICE_NAME*/, names, ctx->count, ctx->req.hostnqn,
+				   prchk_flags, tracepulspdk_bdev_nvme_attach_controller_done, ctx/*, &ctx->req.opts*/);
+		if (rv)
+		{
+			printf("error: can't create bdev device!\n");
+			return -1;
+		}
 #ifdef PULSE_BDEV_DEBUG 
 
 #if 0
