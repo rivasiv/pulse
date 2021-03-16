@@ -1,121 +1,54 @@
-//we have to call spdk_allocate_thread() for every thread and we should
-//continue to do IO from this thread
+/*
+*  bdev_odp.c
+*  
+*  @Purpose : bdev_odp utility
+*  
+*  @Copyright :
+*  
+*  @Author : 
+*/
 
 #include <stdio.h>
 #include <stdbool.h>
 #include <stdatomic.h>
 #include <pthread.h>
-
+#include <stdlib.h>
 #include <rte_errno.h>
 
 #include <odp_api.h>
 
-#include "../../module/bdev/nvme/bdev_nvme.h" 
+#include "bdev_odp.h"
 
-#include "spdk/stdinc.h"
-#include "spdk/bdev.h"
-#include "spdk/accel_engine.h"
-#include "spdk/conf.h"
-#include "spdk/env.h"
-#include "spdk/thread.h"
-#include "spdk/log.h"
-#include "spdk/string.h"
-#include "spdk/queue.h"
-#include "spdk/env_dpdk.h"
 
-#define VERSION "0.971"
-#define MB 1048576
-#define K4 4096
-#define SHM_PKT_POOL_BUF_SIZE  1856
-#define SHM_PKT_POOL_SIZE      (512*2048)
-#define NVME_MAX_BDEVS_PER_RPC 32
-#define MAX_PACKET_SIZE 1600
-#define DEVICE_NAME "PBlaze5"
-#define NUM_THREADS 4
-#define NUM_INPUT_Q 4
-
-#define EE_HEADER_SIZE 11
-#define FILE_NAME "dump.pcap"
-#define BUFFER_SIZE 1048576
-//#define BUFFER_SIZE 1024
-#define THREAD_OFFSET 0x100000000	//4Gb of offset for every thread 
-#define THREAD_LIMIT 0x100000000	//space for every thread to write
-//#define THREAD_LIMIT 0x900		//space for every thread to write
-#define READ_LIMIT 0x100000000		//space for every thread to read
-
-//OPTIONS
-//#define DUMP_PACKET
-//#define DEBUG
-#define HL_DEBUGS			//high level debugs - on writing buffers and counting callbacks
-
-#ifdef DEBUG
- #define debug(x...) printf(x)
-#else
- #define debug(x...)
-#endif
-
-typedef enum {MODE_READ, MODE_WRITE, MODE_RW} mode_e;
-
+//
+//  Global Init 
+//
 typedef struct global_s
 {
-	mode_e mode;
-	char *pci_nvme_addr;
+	mode_e mode;           // App mode read/write/both
+	char *pci_nvme_addr;   // NVME PCIe addr 
 } global_t;
 
 static global_t global = 
 {
 	.mode = MODE_WRITE,
-	.pci_nvme_addr = "0001:01:00.0",
+	.pci_nvme_addr = SPDK_DEVICE_PCIE_ADDR,
 };
 
-/* Used to pass messages between fio threads */
-struct pls_msg {
-	spdk_msg_fn	cb_fn;
-	void		*cb_arg;
-};
 
-//each thread contains its own target
-typedef struct pls_target_s
-{
-	struct spdk_bdev	*bd;
-	struct spdk_bdev_desc	*desc;
-	struct spdk_io_channel	*ch;
-	TAILQ_ENTRY(pls_target_s) link;
-} pls_target_t;
-
-typedef struct pls_thread_s
-{
-	uint32_t core;  //CPU core thread is assigned to
-
-	bool finished;
-	int idx;
-	bool read_complete;		//flag, false when read callback not finished, else - tru
-        unsigned char *buf;
-	uint64_t offset;		//just for stats
-	atomic_ulong a_offset;		//atomic offset for id 0 thread
-	pthread_t pthread_desc;
-        struct spdk_thread *thread; /* spdk thread context */
-        struct spdk_ring *ring; /* ring for passing messages to this thread */
-	pls_target_t pls_target;
-	TAILQ_HEAD(, pls_poller) pollers; /* List of registered pollers on this thread */
-
-} pls_thread_t;
-
-/* A polling function */
-struct pls_poller 
-{
-	spdk_poller_fn		cb_fn;
-	void			*cb_arg;
-	uint64_t		period_microseconds;
-	TAILQ_ENTRY(pls_poller)	link;
-};
-
-const char *names[NVME_MAX_BDEVS_PER_RPC];
+const char *names[NVME_MAX_BDEVS_PER_RPC];// = {"PBlaze5n1", ""};
 pls_thread_t pls_ctrl_thread;
 pls_thread_t pls_read_thread;
 pls_thread_t pls_thread[NUM_THREADS];
 
+
 //odp stuff -----
+
+//Handles DRPC interface got from "DPRC" environmet variable
+#ifdef DPRC_ENV_ENABLED
+char *dprc_container_g = NULL;
+#endif /*DPRC_ENV_ENABLED*/
+
 odp_instance_t odp_instance;
 odp_pool_param_t params;
 odp_pool_t pool;
@@ -137,6 +70,8 @@ int init_spdk(void);
 int init_odp(void);
 
 int deinit_spdk(void);
+
+static void bdev_odp_run(void *args);
 
 void hexdump(void *addr, unsigned int size)
 {
@@ -168,7 +103,7 @@ void hexdump(void *addr, unsigned int size)
 
 static void pls_bdev_init_done(void *cb_arg, int rc)
 {
-	printf("\nNotice! bdev init is done.\n");
+	printf("\nNotice! bdev init is done(%d).\n", rc);
 	*(bool *)cb_arg = true;
 }
 
@@ -351,7 +286,7 @@ static void pls_bdev_write_done_cb(struct spdk_bdev_io *bdev_io, bool success, v
 	static unsigned int cnt = 0;
 	pls_thread_t *t = (pls_thread_t*)cb_arg;
 
-	//printf("bdev write is done\n");
+	printf("bdev write is done\n");
 	if (success)
 	{
 		debug("write completed successfully\n");
@@ -417,6 +352,13 @@ static size_t pls_poll_thread(pls_thread_t *thread)
 	size_t count;
 
 	printf("%s() called \n", __func__);
+
+#define TBD 1 
+#if TBD
+	if (thread->ring == NULL) {
+		printf("\n\n NOT INITED \n\n"); getchar();
+	}
+#endif 
 
 	/* Process new events */
 	count = spdk_ring_dequeue(thread->ring, (void **)&msg, 1);
@@ -536,6 +478,11 @@ static void pulse_pollers_register(void *thread_ctx)
   /*Our app isn't event driven, as SPDK suppose. So do not return callback to continue.*/
 }
 
+static void pulse_bdev_event_cb(enum spdk_bdev_event_type type, struct spdk_bdev *bdev, void *event_ctx)
+{
+	printf("Error! Unsupported bdev event: type %d\n", type);
+}
+
 /* Reports status of created bde over NVME device. 
  *
  *  @{Params} :
@@ -546,31 +493,53 @@ static void pulse_pollers_register(void *thread_ctx)
  *   @{Return} : None
  * 
  * */
-
-static void
-tracepulspdk_bdev_nvme_attach_controller_done (void *cb_ctx, size_t bdev_count, int rc)
+static void tracepulspdk_bdev_nvme_attach_controller_done (void *cb_ctx, size_t bdev_count, int rc)
 {
 	size_t i;
 
     printf("\n\ntracepulspdk_bdev_nvme_attach_controller_done %d\n\n", bdev_count);
 
-	if (cb_ctx != NULL) {
-		printf("Error! %s: SPDK bdev wrong context.", __FUNCTION__);
+	if (cb_ctx == NULL) {
+		printf("Error! %s: SPDK bdev wrong context.\n", __FUNCTION__);
 		return;
 	}
 
 	if (rc < 0) {
-		printf("Error! %s: SPDK bdev returns error %d(%s).", __FUNCTION__, -errno, strerror(-errno));
+		printf("Error! %s: SPDK bdev returns error %d(%s).\n", __FUNCTION__, -errno, strerror(-errno));
 		return;
 	}
 
 	for (i = 0; i < bdev_count; i++) {
-		printf("Notice! %s: SPDK bdev %s added!", __FUNCTION__, names[i]);
+		printf("Notice! %s: SPDK bdev %s added!\n", __FUNCTION__, names[i]);
 	}
 
-    return;
+// This section is for debug purposes, to check the bdev data structures. 
+#ifdef PULSE_BDEV_DEBUG 
+    struct spdk_bdev *bdev = spdk_bdev_first();
+    for (; bdev; bdev = spdk_bdev_next(bdev)) {
+     printf("\nSPDK BDEV DEBUG: BDEV list bdev name %s\n", bdev->name);
+    }
+
+	struct spdk_nvme_transport_id trid = {};
+	trid.trtype = SPDK_NVME_TRANSPORT_PCIE;
+	trid.adrfam = 0;
+
+	memcpy(trid.traddr, SPDK_DEVICE_PCIE_ADDR, strlen(SPDK_DEVICE_PCIE_ADDR));
+	snprintf(&trid.trstring[0], SPDK_NVMF_TRSTRING_MAX_LEN, "%s", SPDK_NVME_TRANSPORT_NAME_PCIE);
+
+	struct nvme_bdev_ctrlr *nvme_bdev_ctrlr_p = nvme_bdev_ctrlr_get(&trid);
+    printf("\nSPDK BDEV DEBUG: BDEV controller bdev name %s\n", nvme_bdev_ctrlr_p->name);
+#endif 
+
+
+    // bdev device succesfully created - continue....
+    spdk_thread_send_msg(pls_ctrl_thread.thread, bdev_odp_run, NULL);
+
+	return;
 }
 
+// Thread init now happens inside SPDK app framework
+#if 0
 /*
  *  SPDK thread functions 
  */
@@ -582,7 +551,7 @@ pls_reactor_thread_op(struct spdk_thread *thread, enum spdk_thread_op op)
 
 	switch (op) {
 		case SPDK_THREAD_OP_NEW:
-			printf("\nReachecd scheduler\\");
+			printf("\nReachecd scheduler\n");
 
 			/*TBD : Action on thread create. For now I am not sure if we need to add something here */
 
@@ -600,7 +569,7 @@ pls_reactor_thread_op(struct spdk_thread *thread, enum spdk_thread_op op)
 static bool
 pls_reactor_thread_op_supported(enum spdk_thread_op op)
 {
-    debug("Debug! Entered %s.", __FUNCTION__ );
+    debug("Debug! Entered %s.\n", __FUNCTION__ );
 
 	switch (op) {
 		case SPDK_THREAD_OP_NEW:
@@ -613,12 +582,63 @@ pls_reactor_thread_op_supported(enum spdk_thread_op op)
 
 	return false;
 }
+#endif
+
+#ifdef PULSE_BDEV_DEBUG 
+/*
+ *   NVME probe callback.  
+ *  
+ */
+static bool pulse_bdev_nvme_probe_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid, struct spdk_nvme_ctrlr_opts *opts)
+{
+	printf("\nSPDK_INIT: Probe to NVMe Controller at %s \n", trid->traddr);
+
+	return true;
+}
+
+/*
+ *  NVME attach callback  
+ *  
+ */
+static void pulse_bdev_nvme_attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid, struct spdk_nvme_ctrlr *ctrlr, const struct spdk_nvme_ctrlr_opts *opts)
+{
+	struct trid_entry       *trid_entry = cb_ctx;
+	struct spdk_pci_addr    pci_addr;
+	struct spdk_pci_device  *pci_dev;
+	struct spdk_pci_id      pci_id;
+
+	printf("\nSPDK_INIT: Attach to NVMe Controller at %s \n", trid->traddr);
+
+	if (trid->trtype != SPDK_NVME_TRANSPORT_PCIE) {
+		printf("Attached to NVMe over Fabrics controller at %s:%s: %s\n",
+		       trid->traddr, trid->trsvcid,
+		       trid->subnqn);
+	} else {
+		if (spdk_pci_addr_parse(&pci_addr, trid->traddr)) {
+			return;
+		}
+
+		pci_dev = spdk_nvme_ctrlr_get_pci_device(ctrlr);
+		if (!pci_dev) {
+			return;
+		}
+
+		pci_id = spdk_pci_device_get_id(pci_dev);
+
+		printf("Attached to NVMe Controller at %s [%04x:%04x]\n",
+		       trid->traddr,
+		       pci_id.vendor_id, pci_id.device_id);
+	}
+  
+	return;
+}
+#endif /* PULSE_BDEV_DEBUG */
 
 int init_spdk(void)
 {
 	int rv = 0;
 	//struct spdk_conf *config;
-	struct spdk_env_opts opts;
+	struct spdk_env_opts opts = {};
 	bool done = false;
 	size_t cnt;
 
@@ -631,17 +651,21 @@ int init_spdk(void)
 
 	printf("%s() called \n", __func__);
 
+/*Now SPDK init is part of SPDK APP framework.*/
+#if 0
 	/* Initialize the environment library */
 	spdk_env_opts_init(&opts);
-	opts.name = "bdev_pls";
+	opts.name = "bdev_odp";
+	opts.shm_id = 0;
+
 
     /* Init SPDK */
 #define ODP_STATIC_LINK   1
 #if ODP_STATIC_LINK
 	/*Not sure this have sence, since utility shouldn't be used without inited ODP*/
+    printf("\nSPDK INIT: spdk_env_init\n");
 	if (spdk_env_init(&opts) < 0) {
 		SPDK_ERRLOG("Unable to initialize SPDK env\n");
-		//spdk_conf_free(config);
 		return -1;
 	}
 #else /*ODP_STATIC_LINK*/
@@ -652,11 +676,10 @@ int init_spdk(void)
 			return -1;
 		}
 	}
-	else {*/
+	else {
 		/*Not sure this have sence, since utility shouldn't be used without inited ODP*/
 		if (spdk_env_init(&opts) < 0) {
 			SPDK_ERRLOG("Unable to initialize SPDK env\n");
-			//spdk_conf_free(config);
 			return -1;
 		}
 	}
@@ -676,43 +699,26 @@ int init_spdk(void)
 	}
 
 	//ring init (calls rte_ring_create() from DPDK inside)
-	pls_ctrl_thread.ring = spdk_ring_create(SPDK_RING_TYPE_MP_SC, 1024, SPDK_ENV_SOCKET_ID_ANY); //4096
+	pls_ctrl_thread.ring = spdk_ring_create(SPDK_RING_TYPE_MP_SC, SPDK_RING_ELEM_NUM, SPDK_ENV_SOCKET_ID_ANY); //4096
 	if (!pls_ctrl_thread.ring) 
 	{
 		SPDK_ERRLOG("failed to allocate ring\n");
 		return -1;
 	}
 
-//	rc = spdk_env_thread_launch_pinned(i,  nvmf_reactor_run, nvmf_reactor);
-
-#if 1
 	struct spdk_cpuset cpumask;
 	spdk_cpuset_zero(&cpumask);
 	spdk_cpuset_set_cpu(&cpumask, spdk_env_get_current_core(), true);  //Assigns control threas to the base core.
 	pls_ctrl_thread.thread = spdk_thread_create("pls_ctrl_thread", &cpumask);	
-	spdk_set_thread(pls_ctrl_thread.thread); //fini procedure to be done
-#else
-	// Initializes the calling(current) thread for I/O channel allocation
-	/* typedef void (*spdk_thread_pass_msg)(spdk_thread_fn fn, void *ctx,
-				     void *thread_ctx); */
-	
-	pls_ctrl_thread.thread = spdk_allocate_thread(pls_send_msg, pls_start_poller,
-                                 pls_stop_poller, &pls_ctrl_thread, "pls_ctrl_thread");
-#endif 
+	spdk_set_thread(pls_ctrl_thread.thread);
     if (!pls_ctrl_thread.thread) 
 	{
         spdk_ring_free(pls_ctrl_thread.ring);
-        SPDK_ERRLOG("failed to allocate thread\n");
+        printf("Error! Failed to allocate thread.\n");
         return -1;
      }
 
 	TAILQ_INIT(&pls_ctrl_thread.pollers);
-
-	/*  NEW SPDK framework is event based. You send message to some SPDK thread(let say create poller), basically a function which would be executed in that thread context
-		and that thread sends the message(the function which would be executed in context of thread choozed as return one).
-	*/
-	// Since we currently do not use event model, so not sending anything to control thread.
-	//spdk_thread_send_msg(pls_ctrl_thread.thread, pulse_continue, NULL);
 
 	/* Initialize the acceleration engine. */
 	// This may be called from pollers only? 	
@@ -720,6 +726,9 @@ int init_spdk(void)
 
 	/* Initialize the bdev layer */
 	spdk_bdev_initialize(pls_bdev_init_done, &done);
+
+	/* initlize the bdev layer */
+	//spdk_subsystem_init(pls_bdev_init_done, &done);
 
 	/* First, poll until initialization is done. */
 	do {
@@ -734,44 +743,101 @@ int init_spdk(void)
 		cnt = pls_poll_thread(&pls_ctrl_thread);
 	} while (cnt > 0);
 
+#endif
 
-	//create device
-	/*
-	int spdk_bdev_nvme_create(struct spdk_nvme_transport_id *trid,       # Transport structure
-				struct spdk_nvme_host_id *hostid,                        # NVME over Fabric 
-				const char *base_name,                                   # Device name - predefined
-				const char **names,                                      # Names of bde returned. Out value 
-				uint32_t count,                                          # bde devices count
-				const char *hostnqn,                                     # 
-				uint32_t prchk_flags,                                    # Optimization flags, looks like default are fine for now. TBD
-				spdk_bdev_create_nvme_fn cb_fn,                          # Creation report callback
-				void *cb_ctx,                                            # Used mostly as rpc context transfer, since we do not use it == NULL
-				struct spdk_nvme_ctrlr_opts *opts);                      # probe() options
-	*/
-	trid.trtype = SPDK_NVME_TRANSPORT_PCIE;
-	trid.adrfam = 0;
-	memcpy(trid.traddr, global.pci_nvme_addr, strlen(global.pci_nvme_addr));
-	snprintf(&trid.trstring[0], SPDK_NVMF_TRSTRING_MAX_LEN, "%s", SPDK_NVME_TRANSPORT_NAME_PCIE);
-	struct spdk_nvme_ctrlr_opts bdev_opts;
+	{   /*Dev create*/
 
-    //int ctx1 =1;
-    // prchk_flags = SPDK_NVME_IO_FLAGS* -- TBD: Do additional checks on flags. Do not found any default one.
+		struct rpc_bdev_nvme_attach_controller_ctx *ctx   = NULL;
+		struct nvme_bdev_ctrlr                     *ctrlr = NULL;
 
-	printf("creating bdev device...\n");
-	//in names returns names of created devices, in count returns number of devices
-	//TBD : shouldn't use spdk_nvme_probe, spdk_nvme_connect, etc instead of create?
-	rv = bdev_nvme_create(&trid, &hostid, DEVICE_NAME, names, count, NULL,
-				   prchk_flags, tracepulspdk_bdev_nvme_attach_controller_done, NULL, &bdev_opts);
-	if (rv)
-	{
-		printf("error: can't create bdev device!\n");
-		return -1;
-	}
+		ctx = calloc(1, sizeof(*ctx));
+		if (!ctx) {
+			printf("\nError! Failed to allocate memory!\n");
+			return -1;
+		}
 
-	for (i = 0; i < (int)count; i++) 
-	{
-		printf("#%d: device %s created \n", i, names[i]);
-	}
+		spdk_nvme_ctrlr_get_default_ctrlr_opts(&ctx->req.opts, sizeof(ctx->req.opts));
+		ctx->req.name = DEVICE_NAME;
+
+		/*
+		int spdk_bdev_nvme_create(struct spdk_nvme_transport_id *trid,       # Transport structure
+					struct spdk_nvme_host_id *hostid,                        # NVME over Fabric 
+					const char *base_name,                                   # Device name - predefined
+					const char **names,                                      # Names of bde returned. Out value 
+					uint32_t count,                                          # bde devices count
+					const char *hostnqn,                                     # 
+					uint32_t prchk_flags,                                    # Optimization flags, looks like default are fine for now. TBD
+					spdk_bdev_create_nvme_fn cb_fn,                          # Creation report callback
+					void *cb_ctx,                                            # Used mostly as rpc context transfer, since we do not use it == NULL
+					struct spdk_nvme_ctrlr_opts *opts);                      # probe() options  // this is part of newer SPDK > v21
+		*/
+		trid.trtype = SPDK_NVME_TRANSPORT_PCIE;
+		trid.adrfam = 0;
+		//memcpy(trid.traddr, global.pci_nvme_addr, strlen(global.pci_nvme_addr));
+		memcpy(trid.traddr, SPDK_DEVICE_PCIE_ADDR, strlen(SPDK_DEVICE_PCIE_ADDR));
+		snprintf(&trid.trstring[0], SPDK_NVMF_TRSTRING_MAX_LEN, "%s", SPDK_NVME_TRANSPORT_NAME_PCIE);
+		struct spdk_nvme_ctrlr_opts bdev_opts;
+		memcpy(hostid.hostsvcid, "\0", 1);
+		// prchk_flags = SPDK_NVME_IO_FLAGS* -- TBD: Do additional checks on flags. Do not found any default one.
+
+		printf("creating bdev device...\n");
+#ifdef PULSE_BDEV_DEBUG 
+
+#if 0
+		// Check we are able to connect to device. 
+		if (spdk_nvme_probe(&trid, &trid, pulse_bdev_nvme_probe_cb, pulse_bdev_nvme_attach_cb, NULL) != 0) {
+			printf("SPDK_INIT: spdk_nvme_probe() failed for transport address '%s'\n",
+				trid.traddr);
+			return -1;
+		}
+#endif
+
+		ctrlr = nvme_bdev_ctrlr_get(&trid);
+		if (ctrlr != 0) {
+			printf("Error! SPDK NVME bdev is already registred in the system. Perhaps the other copy of bdev_odp APP is called.");
+			exit(1); //TBD : handle exit correctly with app stop call.
+		}
+
+
+	#if 0
+		struct spdk_nvme_ctrlr_opts nvme_opts = {};
+		struct spdk_nvme_ctrlr *ctrlr    = NULL;
+
+		spdk_nvme_ctrlr_get_default_ctrlr_opts(&nvme_opts, sizeof(nvme_opts));
+		//memcpy(opts.hostnqn, g_hostnqn, sizeof(nvme_opts.hostnqn));
+		ctrlr = spdk_nvme_connect(&trid, &nvme_opts, sizeof(nvme_opts));
+		if (!ctrlr) {
+			fprintf(stderr, "spdk_nvme_connect() failed\n");
+			return 1;
+		}
+	#endif
+
+
+	#if 0
+
+		// Check we are able to connect to device. 
+		if (spdk_nvme_probe(&trid, &trid, pulse_bdev_nvme_probe_cb, pulse_bdev_nvme_attach_cb, NULL) != 0) {
+			printf("SPDK_INIT: spdk_nvme_probe() failed for transport address '%s'\n",
+				trid.traddr);
+			return -1;
+		}
+	#endif
+
+
+	#if 0
+
+		// Check we are able to connect to device. 
+		if (spdk_nvme_probe(NULL, NULL, pulse_bdev_nvme_probe_cb, pulse_bdev_nvme_attach_cb, NULL) != 0) {
+			printf("SPDK_INIT: spdk_nvme_probe() failed for transport address '%s'\n",
+				trid.traddr);
+			return -1;
+		}
+	#endif
+
+
+#endif /*#ifdef PULSE_BDEV_DEBUG */
+
+	}  /*Dev create*/
 
 	return rv;
 }
@@ -789,17 +855,7 @@ int deinit_spdk(void)
 	int rv = 0;
 
 	/*TBD*/
-    /* rpc_bdev_nvme_detach_controller */   // TBD Is it more resonable to use nvme connect/detouch?
-	/*Ctrl-c handler if not to add it SPDK may stuck on hugepage allocation.*/
 
-	// De-init SPDK thread module
-    spdk_thread_lib_fini();
- 	spdk_env_dpdk_post_fini();
-
-/*    if (libtrace_thread_alloc_num != 0) {
-		printf("\nNot all threads were freed.");
-	}
-*/
 	return rv;
 }
 
@@ -807,6 +863,17 @@ int init_odp(void)
 {
 	int rv = 0;
 	char devname[] = "0";	//XXX - make it parameter or so
+
+#ifdef DPRC_ENV_ENABLED
+	if (dprc_container_g == NULL) {
+			printf("Error! Please set 'DPRC' value.\n");
+			exit(1);
+	} else {
+		if ( (setenv("DPRC", dprc_container_g, 1) != 0)) {
+			printf("Error! Could not reset DPRC value to %s.\n", dprc_container_g);
+		}		 
+	}
+#endif /*DPRC_ENV_ENABLED*/
 
 	rv = odp_init_global(&odp_instance, NULL, NULL);
 	if (rv) exit(1);
@@ -854,52 +921,33 @@ void* init_read_thread(void *arg)
 	offset = 0;
 	thread_limit = offset + READ_LIMIT;
 
-	t->ring = spdk_ring_create(SPDK_RING_TYPE_MP_SC, 4096, SPDK_ENV_SOCKET_ID_ANY);
+	t->ring = spdk_ring_create(SPDK_RING_TYPE_MP_SC, SPDK_RING_ELEM_NUM, SPDK_ENV_SOCKET_ID_ANY);
 	if (!t->ring) 
 	{
 		printf("failed to allocate ring\n");
 		rv = -1; return NULL;
 	}
 
-	// Initializes the calling(current) thread for I/O channel allocation
-	/* typedef void (*spdk_thread_pass_msg)(spdk_thread_fn fn, void *ctx,
-				     void *thread_ctx); */
-#if 1
-    // As per my understanding previously this was assigned to some core only. But now it looks it's still possible to use it withoud assigned core 
+	/*Get SPDK thread and assign current thread to it.*/
 	t->thread = spdk_thread_create("pls_reader_thread", 0);
-	spdk_set_thread(t->thread);
-	spdk_set_thread(pls_thread[0].pthread_desc);
-	spdk_set_thread(NULL); // As in ut. to make this thread belongs to SPDK	
-#else	
-	t->thread = spdk_allocate_thread(pls_send_msg, pls_start_poller,
-                                 pls_stop_poller, (void*)t, "pls_reader_thread");
-#endif
-    if (!t->thread) 
+	if (!t->thread) 
 	{
-        spdk_ring_free(t->ring);
-        SPDK_ERRLOG("failed to allocate thread\n");
-        return NULL;
-    }
-
-	TAILQ_INIT(&t->pollers);
-	spdk_thread_send_msg(t->thread, pulse_pollers_register, t);
-
-	t->pls_target.bd = spdk_bdev_get_by_name(names[0]); //XXX - we always try to open device with idx 0
-	if (!t->pls_target.bd)
-	{
-		printf("failed to get device\n");
-		rv = 1; return NULL;
-	}
-	else
-		printf("got device with name %s\n", names[0]);
-
-	//returns a descriptor
-	rv = spdk_bdev_open(t->pls_target.bd, 1, NULL, NULL, &t->pls_target.desc);
-	if (rv)
-	{
-		printf("failed to open device\n");
+		SPDK_ERRLOG("Error! Failed to allocate READ thread!\n");
 		return NULL;
 	}
+	spdk_set_thread(t->thread);
+
+	TAILQ_INIT(&t->pollers);
+	//spdk_thread_send_msg(t->thread, pulse_pollers_register, t);
+
+	rv = spdk_bdev_open_ext(names[0], true,  pulse_bdev_event_cb, NULL, &t->pls_target.desc);
+	if (rv)
+	{
+		printf("Error! Failed to open %s device!\n", names[0]);
+		return NULL;
+	}
+
+	t->pls_target.bd = spdk_bdev_desc_get_bdev(t->pls_target.desc);
 
 	printf("open io channel\n");
 	t->pls_target.ch = spdk_bdev_get_io_channel(t->pls_target.desc);
@@ -939,14 +987,15 @@ void* init_read_thread(void *arg)
 		rv = spdk_bdev_read(t->pls_target.desc, t->pls_target.ch,
 			bf, offset, nbytes, pls_bdev_read_done_cb, t);
 		//printf("after spdk read\n");
-		if (rv)
+		if (rv) {
 			printf("spdk_bdev_read failed\n");
-		else
+		} else
 		{
 			offset += nbytes;
 			readbytes += nbytes;
-			//printf("spdk_bdev_read NO errors\n");
+			printf("spdk_bdev_read NO errors\n");
 		}
+
 		//need to wait for bdev read completion first
 		while(t->read_complete == false)
 		{
@@ -1001,49 +1050,33 @@ void* init_thread(void *arg)
 	thread_limit = offset + THREAD_LIMIT;
 	printf("%s() called from thread #%d. offset: 0x%lx\n", __func__, t->idx, offset);
 
-	t->ring = spdk_ring_create(SPDK_RING_TYPE_MP_SC, 4096, SPDK_ENV_SOCKET_ID_ANY);
+	t->ring = spdk_ring_create(SPDK_RING_TYPE_MP_SC, SPDK_RING_ELEM_NUM, SPDK_ENV_SOCKET_ID_ANY);
 	if (!t->ring) 
 	{
 		printf("failed to allocate ring\n");
 		rv = -1; return NULL;
 	}
-#if 1
-    // As per my understanding previously this was assigned to some core only. But now it looks it's still possible to use it withoud assigned core 
-	t->thread = spdk_thread_create("pls_writer_thread", 0);	
-#else
-	// Initializes the calling(current) thread for I/O channel allocation
-	/* typedef void (*spdk_thread_pass_msg)(spdk_thread_fn fn, void *ctx,
-				     void *thread_ctx); */
-	
-	t->thread = spdk_allocate_thread(pls_send_msg, pls_start_poller,
-                                 pls_stop_poller, (void*)t, "pls_writer_thread");
-#endif
-    if (!t->thread) 
-	{
-        spdk_ring_free(t->ring);
-        SPDK_ERRLOG("failed to allocate thread\n");
-        return NULL;
-    }
 
-	TAILQ_INIT(&t->pollers);
-	spdk_thread_send_msg(t->thread, pulse_pollers_register, t);
-
-	t->pls_target.bd = spdk_bdev_get_by_name(names[0]); //XXX - we always try to open device with idx 0
-	if (!t->pls_target.bd)
+	t->thread = spdk_thread_create("pls_writer_thread", 0);
+	if (!t->thread) 
 	{
-		printf("failed to get device\n");
-		rv = 1; return NULL;
-	}
-	else
-		printf("got device with name %s\n", names[0]);
-
-	//returns a descriptor
-	rv = spdk_bdev_open(t->pls_target.bd, 1, NULL, NULL, &t->pls_target.desc);
-	if (rv)
-	{
-		printf("failed to open device\n");
+		printf("Error! Failed to allocate WRITE thread!\n");
 		return NULL;
 	}
+	spdk_set_thread(t->thread);
+
+	rv = spdk_bdev_open_ext(names[0], true, pulse_bdev_event_cb, NULL, &t->pls_target.desc);
+	if (rv)
+	{
+		printf("Error! Failed to open %s device!\n", names[0]);
+		return NULL;
+	}
+	else
+	{
+		printf("Notice! Opened %s device!\n", names[0]);
+	}
+
+	t->pls_target.bd = spdk_bdev_desc_get_bdev(&t->pls_target.desc);
 
 	printf("open io channel\n");
 	t->pls_target.ch = spdk_bdev_get_io_channel(t->pls_target.desc);
@@ -1053,7 +1086,6 @@ void* init_thread(void *arg)
 		spdk_bdev_close(t->pls_target.desc);
 		rv = -1; return NULL;
 	}
-
 	printf("spdk thread init done.\n");
 
 	//odp thread init
@@ -1269,71 +1301,25 @@ read:
 	return NULL;
 }
 
-//first param - mode. could be: r,w,b (read, write, both)
-int main(int argc, char *argv[])
+
+static void bdev_odp_run(void *args)
 {
 	int rv = 0;
 	int i;
 	size_t count;
-	char mode = 'w';
 	bool all_finished;
-
-	printf("version: %s\n", VERSION);
-
-	if (argc == 2)
-	{
-		mode = argv[1][0];
-		printf("param: %c \n", mode);
-	}
-	
-	switch (mode)
-	{
-		case 'w':
-			global.mode = MODE_WRITE;
-			break;
-		case 'r':
-			global.mode = MODE_READ;
-			break;
-		case 'b':
-			global.mode = MODE_RW;
-			break;
-		default:
-			global.mode = MODE_WRITE;
-			break;
-	}
-	printf("global.mode: %d \n", global.mode);
-
-	//enable logging
-	spdk_log_set_print_level(SPDK_LOG_DEBUG);
-	spdk_log_set_level(SPDK_LOG_DEBUG);
-	spdk_log_open(NULL);
-
-	rv = init_odp();
-	if (rv)
-	{
-		printf("odp init failed. exiting\n");
-		exit(1);
-	}
-
-	rv = init_spdk();
-	if (rv)
-	{
-		printf("SPDK init failed. exiting\n");
-		deinit_spdk();
-		exit(1);
-	}
 
 	// do odp init and create write threads only in these modes
 	if (global.mode == MODE_RW || global.mode == MODE_WRITE)
 	{
 		rv = odp_pktio_start(pktio);
 		if (rv) {
-			printf("\nthread creation failed. exiting\n");
+			printf("\nError! thread creation failed. Exiting\n");
 			exit(1);
 		}
 
 		rv = odp_pktin_event_queue(pktio, inq, NUM_INPUT_Q);
-		printf("num of input queues configured: %d \n", rv);
+		printf("Number of input queues configured: %d \n", rv);
 
 		for (i = 0; i < NUM_THREADS; i++)
 		{
@@ -1341,7 +1327,7 @@ int main(int argc, char *argv[])
 			rv = pthread_create(&pls_thread[i].pthread_desc, NULL, init_thread, &pls_thread[i]);
 			if (rv)
 			{
-				printf("\nthread creation failed. exiting\n");
+				printf("\nError! Thread creation failed. Exiting.\n");
 				exit(1);
 			}
 		}
@@ -1358,8 +1344,6 @@ int main(int argc, char *argv[])
 			exit(1);
 		}
 	}
-
-	sleep(1);
 
 	//need this poll loop to get callbacks after I/O completions
 	while(1)
@@ -1438,6 +1422,148 @@ int main(int argc, char *argv[])
 	}
 
 	return rv;
-
-  return 0;
 }
+
+
+//first param - mode. could be: r,w,b (read, write, both)
+//int main1(int argc, char *argv[])
+static void bdev_odp_init(void *args)
+{
+	int rv = 0;
+
+	//enable logging
+	spdk_log_set_print_level(SPDK_LOG_DEBUG);
+	spdk_log_set_level(SPDK_LOG_DEBUG);
+	spdk_log_open(NULL);
+
+	rv = init_odp();
+	if (rv)
+	{
+		printf("Error! odp init failed. Exiting.\n");
+		exit(1);
+	}
+
+	rv = init_spdk();
+	if (rv)
+	{
+		printf("Error! SPDK init failed. Exiting\n");
+		deinit_spdk();
+		exit(1);
+	}
+
+	/*
+	 *  The APP is not linear anymore. It would continue when SPDK NVME BDEV succesfully created.
+	 */
+}
+
+static void bdev_odp(void *arg2)
+{
+	struct spdk_cpuset cpumask;
+	spdk_cpuset_zero(&cpumask);
+	spdk_cpuset_set_cpu(&cpumask, spdk_env_get_current_core(), true);  //Assigns control threas to the base core.
+	pls_ctrl_thread.thread = spdk_thread_create("pls_ctrl_thread", &cpumask);	
+    if (!pls_ctrl_thread.thread) 
+	{
+        SPDK_ERRLOG("failed to allocate thread\n");
+        return -1;
+     }
+	spdk_set_thread(pls_ctrl_thread.thread);
+
+	TAILQ_INIT(&pls_ctrl_thread.pollers);
+
+	/*  NEW SPDK framework is event based. You send message to some SPDK thread(let say create poller),
+		basically a function which would be executed in that thread context,
+		and that thread sends the message(the function which would be executed in context of thread choozed as return one).
+	*/
+    spdk_thread_send_msg(pls_ctrl_thread.thread, bdev_odp_init, NULL);
+}
+
+/*
+ *  The entry point
+ */
+
+int main(int argc, char **argv)
+{
+	struct spdk_app_opts opts = {};
+	int rc = 0;
+	char mode = 'w';
+
+	printf("version: %s\n", VERSION);
+
+	if (argc == 2)
+	{
+		mode = argv[1][0];
+		printf("param: %c \n", mode);
+	}
+	
+	//global init
+	memset(&global, 0x0, sizeof(global));
+
+	switch (mode)
+	{
+		case 'w':
+			global.mode = MODE_WRITE;
+			break;
+		case 'r':
+			global.mode = MODE_READ;
+			break;
+		case 'b':
+			global.mode = MODE_RW;
+			break;
+		default:
+			global.mode = MODE_WRITE;
+			break;
+	}
+	printf("global.mode: %d \n", global.mode);
+
+
+#ifdef DPRC_ENV_ENABLED
+    // ARM64/spdk20.11/dpdk20.11 workaround. Removes the DPRC form environment before SPDK starts. Then set it back for correct ODP initialization
+	dprc_container_g = getenv("DPRC");
+	if (NULL == dprc_container_g) {
+		printf("Error! Please set 'DPRC' value.\n");
+		exit(1);
+	}
+	else
+	{
+		printf("NOTICE! DPRC=%s\n", dprc_container_g);
+	}
+	if (unsetenv("DPRC") != 0) {
+		printf("Error! Could not de-init DPRC value.\n");
+	}
+#endif /*DPRC_ENV_ENABLED*/
+
+	/* Set default values in opts structure. */
+	spdk_app_opts_init(&opts, sizeof(opts));
+	opts.name = "bdev_odp";
+
+	/*
+	 * Parse built-in SPDK command line parameters as well
+	 * as our custom one(s).
+	 */
+	if ((rc = spdk_app_parse_args(argc, argv, &opts, "b:", NULL, NULL,
+				      NULL)) != SPDK_APP_PARSE_ARGS_SUCCESS) {
+		exit(rc);
+	}
+
+	/*
+	 * spdk_app_start() will initialize the SPDK framework, call app_func(),
+	 * and then block until spdk_app_stop() is called (or if an initialization
+	 * error occurs, spdk_app_start() will return with rc even without calling
+	 * 
+	 */
+	rc = spdk_app_start(&opts, bdev_odp, NULL);  //TBD : APP global context to correctly pass params should be created
+	if (rc) {
+		SPDK_ERRLOG("ERROR starting application\n");
+	}
+
+	/* At this point either spdk_app_stop() was called, or spdk_app_start()
+	 * failed because of internal error.
+	 */
+
+	/* Gracefully close out all of the SPDK subsystems. */
+	spdk_app_fini();
+	return rc;
+}
+
+
